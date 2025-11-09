@@ -26,25 +26,29 @@ import matplotlib.pyplot as plt
 import copy
 LOG_FREQ = 1
 
-
+#版本1
+#数据模块
 class CLDataTransform(object):
     def __init__(self, transform_weak, transform_strong):
         self.transform_weak = transform_weak
-        self.transform_strong = transform_strong
+        self.transform_strong = transform_strong#初始化弱增强和强增强的变换方法
 
     def __call__(self, sample):
         x_w1 = self.transform_weak(sample)
         x_w2 = self.transform_weak(sample)
-        x_s = self.transform_strong(sample)
+        x_s = self.transform_strong(sample)#得到三种不同增强方式的图像
         return x_w1, x_w2, x_s
 
 
+
+
+#模型模块
 class ResNet(nn.Module):
     def __init__(self, arch='resnet18', num_classes=200, pretrained=True, activation='tanh', classifier='linear'):
         super().__init__()
         assert arch in torchvision.models.__dict__.keys(), f'{arch} is not supported!'
         resnet = torchvision.models.__dict__[arch](pretrained=pretrained)
-        self.backbone = nn.Sequential(
+        self.backbone = nn.Sequential(#共享的特征提取网络
             resnet.conv1,
             resnet.bn1,
             resnet.relu,
@@ -58,6 +62,7 @@ class ResNet(nn.Module):
         self.neck = nn.AdaptiveAvgPool2d(output_size=(1, 1))
         if classifier == 'linear':
             self.classfier_head = nn.Linear(in_features=self.feat_dim, out_features=num_classes)
+           #分类器头-得到样本的类别 logits
             init_weights(self.classfier_head, init_method='He')
         elif classifier.startswith('mlp'):
             sf = float(classifier.split('-')[1])
@@ -65,9 +70,12 @@ class ResNet(nn.Module):
         else:
             raise AssertionError(f'{classifier} classifier is not supported.')
         self.proba_head = torch.nn.Sequential(
+            #概率头-预测样本类型（干净、IDN、OOD）
             MLPHead(self.feat_dim, mlp_scale_factor=1, projection_size=3, init_method='He', activation=activation),
             torch.nn.Sigmoid(),
         )
+        #分类头：输出 [C] 维，预测样本类别
+        #概率头：输出 [3] 维，预测噪声类型（clean/id/ood）
 
     def forward(self, x):
         N = x.size(0)
@@ -258,6 +266,7 @@ def main(cfg, device):
                 if epoch < cfg.warmup_epochs:
                     pbar.set_description(f'WARMUP TRAINING (lr={curr_lr:.3e})')
                     loss = 0.5 * cross_entropy(logits, given_labels, reduction='mean') + 0.5 * cross_entropy(logits_w, given_labels, reduction='mean')
+               #预热阶段-目的：用标准交叉熵训练，获得合理的初始模型
                 else:
                     pbar.set_description(f'ROBUST TRAINING (lr={curr_lr:.3e})')
 
@@ -266,10 +275,12 @@ def main(cfg, device):
                     probs_w = logits_w.softmax(dim=1)
                     with torch.no_grad():
                         mean_pred_prob_dist = (probs + probs_w + given_labels) / 3
+                        # 锐化目标 (ID噪声)
                         sharpened_target_s = (mean_pred_prob_dist / cfg.temperature).softmax(dim=1)
+                        # 平坦化目标 (OOD噪声)  
                         flattened_target_s = (mean_pred_prob_dist * cfg.temperature).softmax(dim=1)
 
-                    # classification loss
+                    # 不同样本类型的分类损失
                     loss_clean = 0.5 * cross_entropy(logits, given_labels, reduction='none') + 0.5 * cross_entropy(logits_w, given_labels, reduction='none')
                     loss_idn = cross_entropy(logits_s, sharpened_target_s, reduction='none')
                     loss_ood = cross_entropy(logits_s, flattened_target_s, reduction='none') * cfg.beta
@@ -285,6 +296,7 @@ def main(cfg, device):
                     if_clean = type_target[:, 0]
                     if_idn = type_target[:, 1]
                     if_ood = type_target[:, 2]
+                    #2.4 样本选择策略  软/硬选择
                     if cfg.weighting == 'soft':
                         # soft seletcion / weighting
                         loss_cls = loss_clean * clean_pred_prob + loss_idn * idn_pred_prob + loss_ood * ood_pred_prob
@@ -345,6 +357,8 @@ def main(cfg, device):
                                 f"{epoch_train_time.avg:6.2f} sec/iter"
                 logger.debug(console_content)
 
+
+#评估与日志记录-----------------------------------------------------------------------------------------------------------------------------------------
         # evaluate this epoch
         eval_result = evaluate(test_loader, net, device)
         test_accuracy = eval_result['accuracy']
@@ -429,3 +443,18 @@ if __name__ == '__main__':
     main(params, dev)
     script_runtime = time.time() - script_start_time
     print(f'Runtime of this script {str(pathlib.Path(__file__))} : {script_runtime:.1f} seconds ({script_runtime/3600:.3f} hours)')
+
+
+
+# 输入样本 → 三视图增强 → 双头网络前向
+#     ↓
+# 获得: 类别预测 + 噪声类型预测
+#     ↓  
+# 计算三类损失:
+#     1. 分类损失 (差异化处理)
+#     2. 辅助损失 (噪声类型监督)  
+#     3. 一致性损失 (ID样本)
+#     ↓
+# 反向传播 → 参数更新
+#     ↓
+# 周期性评估 → 保存最佳模型
